@@ -1,0 +1,672 @@
+---
+title: "EECSE6690 - Final Project Code"
+output: html_notebook
+---
+
+Author: Kosta Andoni (ka2604)
+Date: 05/10/2018
+
+This RMarkdown notebook goes through the process of steps taken to reproduce the results from the Sapsanis paper and then continue with my own work with the SVM. Each R code chunk performs a different task in the whole process. The code chunks are meant to be run in order to get the results. For the most part, code chunks are standalone if all the prerequisite data and packages are loaded.
+
+```{r}
+#Option to suppress warnings in output
+options(warn=-1)
+```
+
+
+First, we load the EMG data from all the subjects. To reproduce the paper's results, each subjects runs must be stored separately. We can store the data together in intermediary steps as long as we keep track of which samples belong to which subject. There are three female subjects and two male subjects, but gender isn't an important variable in this study.
+
+```{r}
+#Using the R.matlab package, we read the data provided in the dataset from the UCI Data Repository at the following link: https://archive.ics.uci.edu/ml/datasets/sEMG+for+Basic+Hand+movements#
+#In order for the code to run properly, the data matrices must be placed into a directory named "Database 1" at the same directory level as this RMD file.
+
+library(R.matlab)
+f1 = readMat("Database 1/female_1.mat")
+f2 = readMat("Database 1/female_2.mat")
+f3 = readMat("Database 1/female_3.mat")
+m1 = readMat("Database 1/male_1.mat")
+m2 = readMat("Database 1/male_2.mat")
+```
+
+
+Lets rearrange the data into a few matrices and lists to make our analysis easier as we move forward and to give our variables meaningful names.
+
+```{r}
+#Row index in all matrices/vectors correspond
+EMG.raw = matrix(data=NA,1800,3000)       #Stores the raw EMG data
+subj.list = rep(list(bquote()),1800)      #Stores the subject number
+grasp.list = rep(list(bquote()),1800)     #Stores the hand movement/grasp
+ch.list = rep(list(bquote()),1800)        #Stores the channel number
+rep.list = rep(list(bquote()),1800)       #Stores the repitition number
+
+#Create a list of all our subjects
+subject.list = c("f1","f2","f3","m1","m2")
+subject.num = 0
+seq.num = 0
+
+#Iterate through the list of subjects, each grasp, and each sequence to extract the raw info
+for (subject in subject.list) {
+  subject.num = subject.num + 1
+  for (grasp in names(get(subject))) {
+    grasp.type = sub("\\..*$", "", grasp)         #Parse the grasp name
+    ch.num = sub('.*(?=.$)', '', grasp, perl=T)   #Parse the channel number
+    for (row in seq(1,30)) {
+      seq.num = seq.num + 1
+      subj.list[seq.num] = subject.num
+      grasp.list[seq.num] = grasp.type
+      ch.list[seq.num] = ch.num
+      rep.list[seq.num] = row
+      EMG.raw[seq.num,] = eval(parse(text = paste(subject,"$",grasp,sep="")))[row,]
+    
+    }
+  }
+}
+
+```
+
+
+Exclude the pre-activation portions of each grasp to only keep the action. This is done through a sliding window approach that averages the raw EMG across the window. If the averaged EMG value crosses a certain threshold, we take the action to start at this point and discard all previous samples.
+
+```{r}
+sliding.window = 20       #Set the window to 40 ms
+
+#Function: slidingIEMG
+#Input: EMG.x - Data vector of raw EMG time series
+#       sliding.window - Number of samples in the window
+#Output: IEMG - Data vector of EMG data averaged in the window
+#Description: A sliding window approach to average data. IEMG stands for 
+#             Integrated Electromyogram
+
+slidingIEMG = function(EMG.x, sliding.window) {
+  #Initialize
+  window.start=1
+  i = 1
+  IEMG = vector(length=floor(length(EMG.x)/sliding.window))
+  
+  #While the end of the window doesn't exceed the bounds of the data vector,
+  #  we can slide the window and take the average of the samples that fall in it
+  while( (window.start + sliding.window - 1) <= length(EMG.x) ) {
+    window.end = window.start + sliding.window - 1        #Calculate end of window
+    IEMG[i] = sum(abs(EMG.x[window.start:window.end]))    #Averaging & storing
+    window.start = window.start + 1                       #Slide the window
+    i = i + 1
+  }
+  
+  #Return the final data vector with the averaged EMG
+  return(IEMG)
+}
+
+#Function: trimEMG
+#Input: EMG.x - Data vector containing raw EMG time series
+#       IEMG - Data vector of averaged EMG data via sliding window
+#Output: A trimmed data vector with inactive samples removed
+#Description: Trims the inactive regions/samples of the data based on when the IEMG exceeds 
+#             the threshold
+
+trimEMG = function(EMG.x,IEMG) {
+  threshold = (max(IEMG)-min(IEMG))/2         #Threshold is half the range
+  cutoff = min(which(IEMG > threshold)) + 1   #Cut the data where the threshold is crossed
+  return(EMG.x[-(1:cutoff-1)])                #Return the cut vector
+}
+
+#__ Main Code __
+
+#Initialize the vector to store the trimmed representations
+EMG.trim = matrix(data=NA,1800,3000)
+
+#For each EMG sequence, trim away the inactive regions - effectively offsetting the start of the sequence to the start of the hand movement
+for(seq in seq(1:nrow(EMG.raw))) {
+  IEMG = slidingIEMG(EMG.raw[seq,],sliding.window)    #Calculate the sliding IEMG vector
+  seq.trimmed = trimEMG(EMG.raw[seq,],IEMG)           #Trim the sequence
+  length(seq.trimmed)                                 #Get the new number of samples in sequence
+  #Store the trimmed sequence and buffer the end of the row with NA
+  EMG.trim[seq,] = c(seq.trimmed, rep(NA, 3000 - length(seq.trimmed)))
+}
+
+
+```
+
+
+Define a data table constructor
+
+```{r}
+#Function: createDataTable
+#Input: NA
+#Output: EMG.df - A data table that stores all the features of interest in our use case
+#Description: Generates and empty data table with columns for each of our features of interest.
+#             A data table is used rather than a data frame so we can store lists in a column (i.e. 3D)
+
+createDataTable = function(){
+  EMG.df=setNames(data.table(matrix(ncol = 56, nrow = 0)),
+        c("subj", "grasp", "ch", "rep", "segNum", "segment",
+          "emgIEMG", "emgZeroCross", "emgSSC", "emgWL", "emgWAMP", "emgVAR", "emgSkew", "emgKurt", 
+          "imf1IEMG", "imf1ZeroCross", "imf1SSC", "imf1WL", "imf1WAMP", "imf1VAR", "imf1Skew", 
+          "imf1Kurt", "imf1IFMedian", "imf1IFSD", "imf1IFKurt", 
+          "imf2IEMG", "imf2ZeroCross", "imf2SSC", "imf2WL", "imf2WAMP", "imf2VAR", "imf2Skew", 
+          "imf2Kurt", "imf2IFMedian", "imf2IFSD", "imf2IFKurt", 
+          "imf3IEMG", "imf3ZeroCross", "imf3SSC", "imf3WL", "imf3WAMP", "imf3VAR", "imf3Skew", 
+          "imf3Kurt", "imf3IFMedian", "imf3IFSD", "imf3IFKurt", 
+          "resIEMG", "resZeroCross", "resSSC", "resWL", "resWAMP", "resVAR", "resSkew", "resKurt",
+          "featVec"))
+  
+  return(EMG.df)
+}
+```
+
+
+Segment the trimmed EMG signals into 300ms segments (overlapping window of 30ms)
+
+```{r}
+library(data.table)
+library(EMD)
+
+#Function: bindDataTable
+#Input: df - Existing EMG data table
+#       subject.num, grasp.type, ch.num, rep.num, seg.num, segment - Data for new row of data table
+#Output: df - EMG data table with new row added
+#Description: Binds a new row of data to the data table
+
+bindDataTable = function(df, subject.num, grasp.type, ch.num, rep.num, seg.num, segment) {
+  df = rbindlist(list(df, data.table(subj=subject.num, grasp=grasp.type, ch=ch.num, rep=rep.num, 
+                                segNum = seg.num, segment=list(segment))), fill=T, use.names=T)
+  return(df)
+}
+
+#Function: segmentSequence
+#Input: EMG.df - EMG data table to store segments and their resective stats
+#       EMG.x - Data vector containing EMG time series for a sequence
+#       EMG.grasp - Type of grasp
+#       EMG.ch - EMG channel data was recorded on
+#       EMG.rep - Repition number of movement
+#       length - Segment length
+#       stride - Distance between segment starts
+#Output: EMG.df - EMG data table with the segments of the input sequence added
+#Description: Partitions an input sequence into segments and appends each segment to a data table
+
+segmentSequence = function(EMG.df, EMG.x, EMG.subj, EMG.grasp, EMG.ch, EMG.rep, length, stride) {
+  #Initialize parameter
+  window.start = 1
+  window.end = window.start + length - 1
+  i = 1
+
+  #While there are still segments to extract in the sequence,
+  #Note: Be careful not to go out of bounds or include any NAs in the segment
+  while(((window.end) <= length(EMG.x)) && (!is.na(EMG.x[window.end]))) {
+    
+    #Grab a segment
+    segment = EMG.x[window.start:window.end]
+    
+    #Append it to the data table
+    EMG.df = bindDataTable(EMG.df, EMG.subj, EMG.grasp, EMG.ch, EMG.rep, i, segment)
+    
+    #Update parameters
+    window.start = window.start + stride
+    window.end = window.start + length - 1
+    i = i +1
+  }
+  
+  #Return populated data table
+  return(EMG.df)
+}
+
+#__ Main Code __
+
+#Initialize the master data table for segments
+EMG.df = createDataTable()
+
+#Initialize parameter
+segment.length = 150
+segment.stride = 15
+
+#For each sequence available, ...
+for(seq in seq(1:nrow(EMG.trim))) {
+  
+  #Bind to master data table in sequence groups of 10 rather than every seqeunce
+  #(This is a performance optimization)
+  if(seq%%10 == 1){
+    if(seq > 1) {
+      EMG.df = rbindlist(list(EMG.df,EMG.df.tmp))
+    }
+    EMG.df.tmp = createDataTable()
+  }
+  
+  #Segment the sequence into segments
+  EMG.df.tmp = segmentSequence(EMG.df.tmp, EMG.trim[seq,], subj.list[seq], grasp.list[seq],
+                               ch.list[seq], rep.list[seq], segment.length, segment.stride)
+}
+
+```
+
+
+Calculate the first three IMFs using EMD for 300ms windows, 30ms apart. Apply the 8 features as listed below
+
+```{r}
+library(EMD)
+library(e1071)
+library(foreach)
+library(doParallel)
+
+#Function: updateDataTableEMD
+#Input: df - Data table row corresponding to a segment
+#Output: df - Updated data table with important statistic
+#Description: Calculates all the statistics for each segment. Warning: Takes hours to run
+#             even with parallelization
+
+updateDataTableEMD = function(df){
+  
+  seg.x = unlist(df$segment)        #Store the segment data as a simple vector
+  decomp.x = emd(seg.x, max.imf=3)  #Decompose the segment data into 3 IMFs and a residual
+                                    #  using the EMD algorithm
+  
+  #Apply the Hilbert transform to each IMF to get the IF
+  decomp.if = hilbertspec(decomp.x$imf)
+  
+  #Calculate the IEMG
+  df[, emgIEMG := as.numeric(mean(abs(seg.x)))]
+  df[, imf1IEMG := as.numeric(mean(abs(decomp.x$imf[,1])))]
+  df[, imf2IEMG := as.numeric(mean(abs(decomp.x$imf[,2])))]
+  df[, imf3IEMG := as.numeric(mean(abs(decomp.x$imf[,3])))]
+  df[, resIEMG := as.numeric(mean(abs(decomp.x$residue)))]
+  
+  #Calculate the zero crossing
+  df[, emgZeroCross := as.numeric(sum(abs(diff(sign(seg.x))))/2)]
+  df[, imf1ZeroCross := as.numeric(sum(abs(diff(sign(decomp.x$imf[,1]))))/2)]
+  df[, imf2ZeroCross := as.numeric(sum(abs(diff(sign(decomp.x$imf[,2]))))/2)]
+  df[, imf3ZeroCross := as.numeric(sum(abs(diff(sign(decomp.x$imf[,3]))))/2)]
+  df[, resZeroCross := as.numeric(sum(abs(diff(sign(decomp.x$residue))))/2)]
+
+  #Calculate the slope sign change
+  df[, emgSSC := as.numeric(sum(abs(diff(sign(diff(seg.x))))))/2]
+  df[, imf1SSC := as.numeric(sum(abs(diff(sign(diff(decomp.x$imf[,1]))))))/2]
+  df[, imf2SSC := as.numeric(sum(abs(diff(sign(diff(decomp.x$imf[,2]))))))/2]
+  df[, imf3SSC := as.numeric(sum(abs(diff(sign(diff(decomp.x$imf[,3]))))))/2]
+  df[, resSSC := as.numeric(sum(abs(diff(sign(diff(decomp.x$residue))))))/2]
+  
+  #Calculate the Willison Amplitude
+  df[, emgWL := as.numeric(sum(abs(diff(seg.x))))]
+  df[, imf1WL := as.numeric(sum(abs(diff(decomp.x$imf[,1]))))]
+  df[, imf2WL := as.numeric(sum(abs(diff(decomp.x$imf[,2]))))]
+  df[, imf3WL := as.numeric(sum(abs(diff(decomp.x$imf[,3]))))]
+  df[, resWL := as.numeric(sum(abs(diff(decomp.x$residue))))]
+  
+  #Calculate the waveform length
+  df[, emgWAMP := as.numeric(length(which(abs(diff(seg.x)) > 1.5)))]
+  df[, imf1WAMP := as.numeric(length(which(abs(diff(decomp.x$imf[,1])) > 1.0)))]
+  df[, imf2WAMP := as.numeric(length(which(abs(diff(decomp.x$imf[,2])) > 0.5)))]
+  df[, imf3WAMP := as.numeric(length(which(abs(diff(decomp.x$imf[,3])) > 0.25)))]
+  df[, resWAMP := as.numeric(length(which(abs(diff(decomp.x$residue)) > 0.1)))]
+  
+  #Calculate the Variance
+  df[, emgVAR := as.numeric(var(seg.x))]
+  df[, imf1VAR := as.numeric(var(decomp.x$imf[,1]))]
+  df[, imf2VAR := as.numeric(var(decomp.x$imf[,2]))]
+  df[, imf3VAR := as.numeric(var(decomp.x$imf[,3]))]
+  df[, resVAR := as.numeric(var(decomp.x$residue))]
+  
+  #Calculate the Skewness
+  df[, emgSkew := as.numeric(skewness(seg.x))]
+  df[, imf1Skew := as.numeric(skewness(decomp.x$imf[,1]))]
+  df[, imf2Skew := as.numeric(skewness(decomp.x$imf[,2]))]
+  df[, imf3Skew := as.numeric(skewness(decomp.x$imf[,3]))]
+  df[, resSkew := as.numeric(skewness(decomp.x$residue))]
+  
+  #Calculate the Kurtosis
+  df[, emgKurt := as.numeric(kurtosis(seg.x))]
+  df[, imf1Kurt := as.numeric(kurtosis(decomp.x$imf[,1]))]
+  df[, imf2Kurt := as.numeric(kurtosis(decomp.x$imf[,2]))]
+  df[, imf3Kurt := as.numeric(kurtosis(decomp.x$imf[,3]))]
+  df[, resKurt := as.numeric(kurtosis(decomp.x$residue))]
+  
+  #Calculate the Median of the IFs
+  df[, imf1IFMedian := as.numeric(median(decomp.if$instantfreq[,1]))]
+  df[, imf2IFMedian := as.numeric(median(decomp.if$instantfreq[,2]))]
+  df[, imf3IFMedian := as.numeric(median(decomp.if$instantfreq[,3]))]
+  
+  #Calculate the Standard Deviation of the IFs
+  df[, imf1IFSD := as.numeric(sd(decomp.if$instantfreq[,1]))]
+  df[, imf2IFSD := as.numeric(sd(decomp.if$instantfreq[,2]))]
+  df[, imf3IFSD := as.numeric(sd(decomp.if$instantfreq[,3]))]
+  
+  #Calculate the Kurtosis of the IFs
+  df[, imf1IFKurt := as.numeric(kurtosis(decomp.if$instantfreq[,1]))]
+  df[, imf2IFKurt := as.numeric(kurtosis(decomp.if$instantfreq[,2]))]
+  df[, imf3IFKurt := as.numeric(kurtosis(decomp.if$instantfreq[,3]))]
+  
+  return(df)
+}
+
+#__ Main Code__
+
+#Initialize the data tables
+EMG.df.update = createDataTable()
+EMG.df.tmp = createDataTable()
+
+#Configure the core cluster to perform the parallel computing
+cores=detectCores()
+cl <- makeCluster(cores[1]-1, useXDR=F)
+registerDoParallel(cl)
+
+#Implement updating the EMG data table features using parallel programming
+EMG.df.update <- foreach(i=1:nrow(EMG.df), .combine=function(x,y)rbindlist(list(x,y)), 
+                         .packages=c('EMD','data.table','e1071'), .verbose=T) %dopar% {
+  
+  #Update the data table for each segment                         
+  EMG.df.tmp = updateDataTableEMD(EMG.df[i])
+
+  #Bind the temp data.table to the updated EMG data table
+  EMG.df.tmp 
+}
+
+#Release the core cluster
+stopCluster(cl)
+
+#Replace the master data table with the updated statistics
+EMG.df = copy(EMG.df.update)
+
+```
+
+
+Trim the data table into a data frame. Also, factor the hand movements into 1 through 6.
+1: Spherical - spher 
+2: Tip - tip
+3: Palmar - palm
+4: Lateral - lat
+5: Cylindrical - cyl
+6: Hook - hook
+
+```{r}
+#Create a data table for just the features - leaving the EMG data behind
+EMG.df.features = copy(EMG.df)
+EMG.df.features[, c("featVec", "segment") := NULL]
+
+#Convert types to numeric rather than list
+EMG.df.features[, subj := as.numeric(EMG.df.features[, subj])]
+EMG.df.features[, ch := as.numeric(EMG.df.features[, ch])]
+EMG.df.features[, rep := as.numeric(EMG.df.features[, rep])]
+
+#Factor the grasp data
+EMG.df.features[, grasp := factor(EMG.df.features[, grasp], 
+                                  levels=c('spher','tip','palm','lat','cyl','hook'),
+                                  labels=c('S','T','P','L','C','H'))]
+
+#Convert data table to data frame                                 
+setDF(EMG.df.features)
+```
+
+
+Perform PCA to remove redundancies in the feature vector. Not implemented further than dimension reduction investigation. Data is not reduced for subsequent steps but this is where we would start.
+
+```{r}
+#Do PCA - without the qualitative variables
+EMG.pca = prcomp(EMG.df.features[, !names(EMG.df.features) %in%
+                                   c("subj","ch","rep","segNum","grasp")], scale. = T, tol=0.05)
+summary(EMG.pca)
+
+```
+
+
+Divide the dataset per subject - including training and testing sets. Put the feature vector through the linear classifier - LDA approach - and present the confusion matrix
+
+```{r}
+library(MASS)
+library(caret)
+
+#Initialize the seeds for 5x2 cross validation
+seeds = c(04081994,07041994,06122015,09202015,05102018)
+
+#Initialize vectors to store the accumulated predictions across 5 loops
+EMG.subj1.pred.accum = character()
+EMG.subj2.pred.accum = character()
+EMG.subj3.pred.accum = character()
+EMG.subj4.pred.accum = character()
+EMG.subj5.pred.accum = character()
+
+#Initialize vectors to store the accumulated actual values across 5 loops
+EMG.subj1.test.accum = character()
+EMG.subj2.test.accum = character()
+EMG.subj3.test.accum = character()
+EMG.subj4.test.accum = character()
+EMG.subj5.test.accum = character()
+
+#Iterate through each seed to implement 5x2 cross validation
+for( i in seq(1,length(seeds))) {
+  set.seed(seeds[i])
+  
+  #For each subject, pull their data from the master data frame - EMG.df.features
+  #Then, split the data into a training and testing set (50/50)
+  
+  #Subject 1
+  EMG.df.subj1 = subset(EMG.df.features, subj==1)
+  
+  sample_size = floor(0.5 * nrow(EMG.df.subj1))
+  train_indices = sample(seq_len(nrow(EMG.df.subj1)), size = sample_size)
+  EMG.df.subj1.train = EMG.df.subj1[train_indices,]
+  EMG.df.subj1.test = EMG.df.subj1[-train_indices,]
+  
+  #Subject2
+  EMG.df.subj2 = subset(EMG.df.features, subj==2)
+  
+  sample_size = floor(0.5 * nrow(EMG.df.subj2))
+  train_indices = sample(seq_len(nrow(EMG.df.subj2)), size = sample_size)
+  EMG.df.subj2.train = EMG.df.subj2[train_indices,]
+  EMG.df.subj2.test = EMG.df.subj2[-train_indices,]
+  
+  #Subject3
+  EMG.df.subj3 = subset(EMG.df.features, subj==3)
+  
+  sample_size = floor(0.5 * nrow(EMG.df.subj3))
+  train_indices = sample(seq_len(nrow(EMG.df.subj3)), size = sample_size)
+  EMG.df.subj3.train = EMG.df.subj3[train_indices,]
+  EMG.df.subj3.test = EMG.df.subj3[-train_indices,]
+  
+  #Subject4
+  EMG.df.subj4 = subset(EMG.df.features, subj==4)
+  
+  sample_size = floor(0.5 * nrow(EMG.df.subj4))
+  train_indices = sample(seq_len(nrow(EMG.df.subj4)), size = sample_size)
+  EMG.df.subj4.train = EMG.df.subj4[train_indices,]
+  EMG.df.subj4.test = EMG.df.subj4[-train_indices,]
+  
+  #Subject5
+  EMG.df.subj5 = subset(EMG.df.features, subj==5)
+  
+  sample_size = floor(0.5 * nrow(EMG.df.subj5))
+  train_indices = sample(seq_len(nrow(EMG.df.subj5)), size = sample_size)
+  EMG.df.subj5.train = EMG.df.subj5[train_indices,]
+  EMG.df.subj5.test = EMG.df.subj5[-train_indices,]
+  
+  
+  # Subject1 - Fit model
+  EMG.subj1.lda = lda(grasp~. - subj - ch - rep - segNum, data=EMG.df.subj1.train)
+  # Subject1 - Make predictions
+  EMG.subj1.pred = predict(EMG.subj1.lda, EMG.df.subj1.test)$class
+  # Subject1 - Append results to accumulation vectors
+  EMG.subj1.pred.accum = c(EMG.subj1.pred.accum, EMG.subj1.pred)
+  EMG.subj1.test.accum = c(EMG.subj1.test.accum, EMG.df.subj1.test$grasp)
+  
+  
+  # Subject2 - Fit model
+  EMG.subj2.lda = lda(grasp~. - subj - ch - rep - segNum, data=EMG.df.subj2.train)
+  # Subject2 - Make predictions
+  EMG.subj2.pred = predict(EMG.subj2.lda, EMG.df.subj2.test)$class
+  # Subject2 - Append results to accumulation vectors
+  EMG.subj2.pred.accum = c(EMG.subj2.pred.accum, EMG.subj2.pred)
+  EMG.subj2.test.accum = c(EMG.subj2.test.accum, EMG.df.subj2.test$grasp)
+  
+  
+  # Subject3 - Fit model
+  EMG.subj3.lda = lda(grasp~. - subj - ch - rep - segNum, data=EMG.df.subj3.train)
+  # Subject3 - Make predictions
+  EMG.subj3.pred = predict(EMG.subj3.lda, EMG.df.subj3.test)$class
+  # Subject3 - Append results to accumulation vectors
+  EMG.subj3.pred.accum = c(EMG.subj3.pred.accum, EMG.subj3.pred)
+  EMG.subj3.test.accum = c(EMG.subj3.test.accum, EMG.df.subj3.test$grasp)
+  
+  
+  # Subject4 - Fit model
+  EMG.subj4.lda = lda(grasp~. - subj - ch - rep - segNum, data=EMG.df.subj4.train)
+  # Subject4 - Make predictions
+  EMG.subj4.pred = predict(EMG.subj4.lda, EMG.df.subj4.test)$class
+  # Subject4 - Append results to accumulation vectors
+  EMG.subj4.pred.accum = c(EMG.subj4.pred.accum, EMG.subj4.pred)
+  EMG.subj4.test.accum = c(EMG.subj4.test.accum, EMG.df.subj4.test$grasp)
+  
+  
+  # Subject5 - Fit model
+  EMG.subj5.lda = lda(grasp~. - subj - ch - rep - segNum, data=EMG.df.subj5.train)
+  # Subject5 - Make predictions
+  EMG.subj5.pred = predict(EMG.subj5.lda, EMG.df.subj5.test)$class
+  # Subject5 - Append results to accumulation vectors
+  EMG.subj5.pred.accum = c(EMG.subj5.pred.accum, EMG.subj5.pred)
+  EMG.subj5.test.accum = c(EMG.subj5.test.accum, EMG.df.subj5.test$grasp)
+  
+}
+
+
+#Factor all the prediction accumulation vectors for the confusion matrix
+EMG.subj1.pred.accum = factor(EMG.subj1.pred.accum, 
+                              levels=1:6,
+                              labels=c('S','T','P','L','C','H'))
+EMG.subj2.pred.accum = factor(EMG.subj2.pred.accum, 
+                              levels=1:6,
+                              labels=c('S','T','P','L','C','H'))
+EMG.subj3.pred.accum = factor(EMG.subj3.pred.accum, 
+                              levels=1:6,
+                              labels=c('S','T','P','L','C','H'))
+EMG.subj4.pred.accum = factor(EMG.subj4.pred.accum, 
+                              levels=1:6,
+                              labels=c('S','T','P','L','C','H'))
+EMG.subj5.pred.accum = factor(EMG.subj5.pred.accum, 
+                              levels=1:6,
+                              labels=c('S','T','P','L','C','H'))
+
+
+#Factor all the test accumulation vectors for the confusion matrix
+EMG.subj1.test.accum = factor(EMG.subj1.test.accum, 
+                              levels=1:6,
+                              labels=c('S','T','P','L','C','H'))
+EMG.subj2.test.accum = factor(EMG.subj2.test.accum, 
+                              levels=1:6,
+                              labels=c('S','T','P','L','C','H'))
+EMG.subj3.test.accum = factor(EMG.subj3.test.accum, 
+                              levels=1:6,
+                              labels=c('S','T','P','L','C','H'))
+EMG.subj4.test.accum = factor(EMG.subj4.test.accum, 
+                              levels=1:6,
+                              labels=c('S','T','P','L','C','H'))
+EMG.subj5.test.accum = factor(EMG.subj5.test.accum, 
+                              levels=1:6,
+                              labels=c('S','T','P','L','C','H'))
+
+
+#Create a confusion matrix for each subject's results
+confusionMatrix(EMG.subj1.pred.accum, EMG.subj1.test.accum)
+confusionMatrix(EMG.subj2.pred.accum, EMG.subj2.test.accum)
+confusionMatrix(EMG.subj3.pred.accum, EMG.subj3.test.accum)
+confusionMatrix(EMG.subj4.pred.accum, EMG.subj4.test.accum)
+confusionMatrix(EMG.subj5.pred.accum, EMG.subj5.test.accum)
+
+```
+
+
+Now put the feature vector through SVM (with a radial kernel) and present the confusion matrix
+
+```{r}
+#Initialize 
+cost = c(0.01, 0.1, 1, 10, 100)   #List of cost parameters to test
+gamma= c(0.01, 0.1, 1, 10, 100)   #List of gamma parameters to test
+samples.to.use=5000               #Limit of segments to use to make computation faster/less complex
+
+#Scale the training data to normalize for SVM. Works but SVM quality is very poor.Needs to be explored.
+#EMG.df.subj1.train[, !names(EMG.df.subj1.train) %in% c("subj","ch","rep","segNum","grasp")] = 
+  #scale(EMG.df.subj1.train[, !names(EMG.df.subj1.train) %in% c("subj","ch","rep","segNum","grasp")])
+
+#For each subject, tune the svm to find the lowest training error. 
+#Then, use the best model to make predictions on the testing set
+#Finally, present the confusion matrix
+
+#Subject 1
+EMG.subj1.svm.rbf = tune(svm, grasp~. - subj - ch - rep - segNum,  
+                     data=EMG.df.subj1.train[1:samples.to.use,],
+                     kernel = "radial", ranges = list(cost=cost, gamma=gamma))
+EMG.subj1.svm.pred.rbf = predict(EMG.subj1.svm.rbf$best.model, EMG.df.subj1.test)
+confusionMatrix(EMG.subj1.svm.pred.rbf, EMG.df.subj1.test$grasp)
+
+#Subject 2
+EMG.subj2.svm.rbf = tune(svm, grasp~. - subj - ch - rep - segNum,  
+                     data=EMG.df.subj2.train[1:samples.to.use,],
+                     kernel = "radial", ranges = list(cost=cost, gamma=gamma))
+EMG.subj2.svm.pred.rbf = predict(EMG.subj2.svm.rbf$best.model, EMG.df.subj2.test)
+confusionMatrix(EMG.subj2.svm.pred.rbf, EMG.df.subj2.test$grasp)
+
+#Subject 3
+EMG.subj3.svm.rbf = tune(svm, grasp~. - subj - ch - rep - segNum,  
+                     data=EMG.df.subj3.train[1:samples.to.use,],
+                     kernel = "radial", ranges = list(cost=cost, gamma=gamma))
+EMG.subj3.svm.pred.rbf = predict(EMG.subj3.svm.rbf$best.model, EMG.df.subj3.test)
+confusionMatrix(EMG.subj3.svm.pred.rbf, EMG.df.subj3.test$grasp)
+
+#Subject 4
+EMG.subj4.svm.rbf = tune(svm, grasp~. - subj - ch - rep - segNum,  
+                     data=EMG.df.subj4.train[1:samples.to.use,],
+                     kernel = "radial", ranges = list(cost=cost, gamma=gamma))
+EMG.subj4.svm.pred.rbf = predict(EMG.subj4.svm.rbf$best.model, EMG.df.subj4.test)
+confusionMatrix(EMG.subj4.svm.pred.rbf, EMG.df.subj4.test$grasp)
+
+#Subject 5
+EMG.subj5.svm.rbf = tune(svm, grasp~. - subj - ch - rep - segNum,  
+                     data=EMG.df.subj5.train[1:samples.to.use,],
+                     kernel = "radial", ranges = list(cost=cost, gamma=gamma))
+EMG.subj5.svm.pred.rbf = predict(EMG.subj5.svm.rbf$best.model, EMG.df.subj5.test)
+confusionMatrix(EMG.subj5.svm.pred.rbf, EMG.df.subj5.test$grasp)
+
+```
+
+
+Now put the feature vector through SVM (with a linear kernel) and present the confusion matrix
+
+```{r}
+#Initialize 
+cost = c(0.01, 0.1, 1, 10, 100)   #List of cost parameters to test
+samples.to.use=1000               #Limit of segments to use to make computation faster/less complex
+
+
+#For each subject, tune the svm to find the lowest training error. 
+#Then, use the best model to make predictions on the testing set
+#Finally, present the confusion matrix
+
+#Subject 1
+EMG.subj1.svm.lin = tune(svm, grasp~. - subj - ch - rep - segNum,  
+                     data=EMG.df.subj1.train[1:samples.to.use,],
+                     kernel = "linear", ranges = list(cost=cost, gamma=gamma))
+EMG.subj1.svm.pred.lin = predict(EMG.subj1.svm.lin$best.model, EMG.df.subj1.test)
+confusionMatrix(EMG.subj1.svm.pred.lin, EMG.df.subj1.test$grasp)
+
+#Subject 2
+EMG.subj2.svm.lin = tune(svm, grasp~. - subj - ch - rep - segNum,  
+                     data=EMG.df.subj2.train[1:samples.to.use,],
+                     kernel = "linear", ranges = list(cost=cost, gamma=gamma))
+EMG.subj2.svm.pred.lin = predict(EMG.subj2.svm.lin$best.model, EMG.df.subj2.test)
+confusionMatrix(EMG.subj2.svm.pred.lin, EMG.df.subj2.test$grasp)
+
+#Subject 3
+EMG.subj3.svm.lin = tune(svm, grasp~. - subj - ch - rep - segNum,  
+                     data=EMG.df.subj3.train[1:samples.to.use,],
+                     kernel = "linear", ranges = list(cost=cost, gamma=gamma))
+EMG.subj3.svm.pred.lin = predict(EMG.subj3.svm.lin$best.model, EMG.df.subj3.test)
+confusionMatrix(EMG.subj3.svm.pred.lin, EMG.df.subj3.test$grasp)
+
+#Subject 4
+EMG.subj4.svm.lin = tune(svm, grasp~. - subj - ch - rep - segNum,  
+                     data=EMG.df.subj4.train[1:samples.to.use,],
+                     kernel = "linear", ranges = list(cost=cost, gamma=gamma))
+EMG.subj4.svm.pred.lin = predict(EMG.subj4.svm.lin$best.model, EMG.df.subj4.test)
+confusionMatrix(EMG.subj4.svm.pred.lin, EMG.df.subj4.test$grasp)
+
+#Subject 5
+EMG.subj5.svm.lin = tune(svm, grasp~. - subj - ch - rep - segNum,  
+                     data=EMG.df.subj5.train[1:samples.to.use,],
+                     kernel = "linear", ranges = list(cost=cost, gamma=gamma))
+EMG.subj5.svm.pred.lin = predict(EMG.subj5.svm.lin$best.model, EMG.df.subj5.test)
+confusionMatrix(EMG.subj5.svm.pred.lin, EMG.df.subj5.test$grasp)
+```
